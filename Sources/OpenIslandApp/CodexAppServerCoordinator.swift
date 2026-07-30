@@ -219,12 +219,6 @@ final class CodexAppServerCoordinator {
                 }
                 return
             }
-            if thread.status.type != .notLoaded {
-                enqueuePendingNotification(
-                    .threadStatusChanged(threadId: thread.id, status: thread.status),
-                    for: thread.id
-                )
-            }
             onRolloutRediscoveryNeeded?()
 
         case .threadStatusChanged(let threadId, let status):
