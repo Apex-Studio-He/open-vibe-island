@@ -660,6 +660,7 @@ final class AppModel {
         discovery.onStateChanged = { [weak self] in
             self?.synchronizeSelection()
             self?.refreshOverlayPlacementIfVisible()
+            self?.codexAppServer.replayPendingNotificationsForTrackedSessions()
             self?.codexAppServer.refreshThreadsIfNeeded()
         }
         discovery.onAgentEvent = { [weak self] event in
@@ -703,6 +704,9 @@ final class AppModel {
         }
         codexAppServer.existingCodexMetadata = { [weak self] id in
             self?.state.session(id: id)?.codexMetadata
+        }
+        codexAppServer.existingThreadTitle = { [weak self] id in
+            self?.state.session(id: id)?.title
         }
         codexAppServer.existingJumpTarget = { [weak self] id in
             self?.state.session(id: id)?.jumpTarget

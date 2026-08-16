@@ -168,6 +168,68 @@ struct CodexAppServerCoordinatorTests {
 
     @MainActor
     @Test
+    func untrackedThreadStatusReplaysAfterRolloutCreatesSession() throws {
+        let coordinator = CodexAppServerCoordinator()
+        var state = SessionState()
+        var events: [AgentEvent] = []
+        var rediscoveryRequestCount = 0
+        coordinator.onEvent = {
+            events.append($0)
+            state.apply($0)
+        }
+        coordinator.trackedRuntimeSurface = { state.session(id: $0)?.codexRuntimeSurface }
+        coordinator.existingThreadTitle = { state.session(id: $0)?.title }
+        coordinator.existingCodexMetadata = { state.session(id: $0)?.codexMetadata }
+        coordinator.existingJumpTarget = { state.session(id: $0)?.jumpTarget }
+        coordinator.persistedThreadConfiguration = { _ in nil }
+        coordinator.onRolloutRediscoveryNeeded = { rediscoveryRequestCount += 1 }
+
+        let thread = try JSONDecoder().decode(CodexThread.self, from: Data("""
+        {"id":"delayed-rollout-thread","cwd":"/tmp/git","name":"Delayed rollout task","preview":"Prompt","modelProvider":"openai","createdAt":1,"updatedAt":2,"ephemeral":false,"path":"/tmp/delayed-rollout.jsonl","status":{"type":"active","activeFlags":["waitingOnApproval"]},"source":"vscode","turns":[]}
+        """.utf8))
+
+        coordinator.handleNotification(.threadStarted(thread: thread))
+        coordinator.handleNotification(
+            .threadStatusChanged(
+                threadId: thread.id,
+                status: thread.status
+            )
+        )
+
+        #expect(events.isEmpty)
+        #expect(rediscoveryRequestCount == 2)
+
+        state = SessionState(sessions: [
+            AgentSession(
+                id: thread.id,
+                title: thread.name ?? "Codex",
+                tool: .codex,
+                origin: .live,
+                phase: .running,
+                summary: "Imported from rollout.",
+                updatedAt: Date(timeIntervalSince1970: 1),
+                codexMetadata: CodexSessionMetadata(transcriptPath: thread.path),
+                codexRuntimeSurface: .desktopApp
+            ),
+        ])
+
+        coordinator.replayPendingNotificationsForTrackedSessions()
+
+        #expect(state.session(id: thread.id)?.phase == .waitingForApproval)
+        #expect(state.session(id: thread.id)?.permissionRequest != nil)
+        #expect(events.filter {
+            if case .permissionRequested = $0 { true } else { false }
+        }.count == 1)
+
+        coordinator.replayPendingNotificationsForTrackedSessions()
+
+        #expect(events.filter {
+            if case .permissionRequested = $0 { true } else { false }
+        }.count == 1)
+    }
+
+    @MainActor
+    @Test
     func threadNameNotificationEmitsTitleUpdate() {
         let coordinator = CodexAppServerCoordinator()
         var events: [AgentEvent] = []
@@ -187,6 +249,26 @@ struct CodexAppServerCoordinatorTests {
         }
         #expect(payload.sessionID == "codex-thread-1")
         #expect(payload.title == "Fix Open Island task titles")
+    }
+
+    @MainActor
+    @Test
+    func unchangedThreadNameNotificationIsIgnored() {
+        let coordinator = CodexAppServerCoordinator()
+        var events: [AgentEvent] = []
+        coordinator.onEvent = { events.append($0) }
+        coordinator.existingThreadTitle = { threadID in
+            threadID == "codex-thread-1" ? "Fix Open Island task titles" : nil
+        }
+
+        coordinator.handleNotification(
+            .threadNameUpdated(
+                threadId: "codex-thread-1",
+                name: "  Fix Open Island task titles  "
+            )
+        )
+
+        #expect(events.isEmpty)
     }
 
     @MainActor

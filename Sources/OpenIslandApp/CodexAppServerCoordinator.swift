@@ -23,6 +23,11 @@ final class CodexAppServerCoordinator {
     @ObservationIgnored
     private var lastThreadSyncDate = Date.distantPast
 
+    @ObservationIgnored
+    private var pendingNotificationsByThreadID: [String: [CodexAppServerNotification]] = [:]
+
+    private static let maxPendingNotificationsPerThread = 16
+
     /// Callback to emit AgentEvents into AppModel.
     @ObservationIgnored
     var onEvent: ((AgentEvent) -> Void)?
@@ -47,6 +52,9 @@ final class CodexAppServerCoordinator {
     /// model sync never erases prompt/tool state gathered from rollout hooks.
     @ObservationIgnored
     var existingCodexMetadata: ((String) -> CodexSessionMetadata?) = { _ in nil }
+
+    @ObservationIgnored
+    var existingThreadTitle: ((String) -> String?) = { _ in nil }
 
     @ObservationIgnored
     var existingJumpTarget: ((String) -> JumpTarget?) = { _ in nil }
@@ -124,6 +132,7 @@ final class CodexAppServerCoordinator {
         threadSyncTask = nil
         client?.stop()
         client = nil
+        pendingNotificationsByThreadID.removeAll()
         isConnected = false
     }
 
@@ -164,6 +173,7 @@ final class CodexAppServerCoordinator {
         for thread in threads where !thread.ephemeral {
             if let runtimeSurface = trackedRuntimeSurface(thread.id) {
                 enrichTrackedThread(thread, runtimeSurface: runtimeSurface)
+                replayPendingNotifications(for: thread.id)
                 if runtimeSurface == .unknown {
                     observedUntrackedThread = true
                 }
@@ -177,9 +187,28 @@ final class CodexAppServerCoordinator {
         }
     }
 
+    /// Replays app-server notifications that arrived before rollout discovery
+    /// created their sessions. Discovery calls this immediately after replacing
+    /// state; `syncThreads` also drains per-thread queues as a fallback.
+    func replayPendingNotificationsForTrackedSessions() {
+        let trackedThreadIDs = pendingNotificationsByThreadID.keys.filter {
+            trackedRuntimeSurface($0) != nil
+        }
+        for threadID in trackedThreadIDs {
+            replayPendingNotifications(for: threadID)
+        }
+    }
+
     // MARK: - Notification handling
 
     func handleNotification(_ notification: CodexAppServerNotification) {
+        if let threadID = sessionIDToBufferUntilTracked(for: notification),
+           trackedRuntimeSurface(threadID) == nil {
+            enqueuePendingNotification(notification, for: threadID)
+            onRolloutRediscoveryNeeded?()
+            return
+        }
+
         switch notification {
         case .threadStarted(let thread):
             guard !thread.ephemeral else { return }
@@ -306,6 +335,53 @@ final class CodexAppServerCoordinator {
 
     // MARK: - Helpers
 
+    private func sessionIDToBufferUntilTracked(
+        for notification: CodexAppServerNotification
+    ) -> String? {
+        switch notification {
+        case .threadStarted, .unknown:
+            nil
+        case let .threadStatusChanged(threadID, _),
+             let .threadClosed(threadID),
+             let .turnStarted(threadID, _),
+             let .turnCompleted(threadID, _):
+            threadID
+        case .threadNameUpdated:
+            nil
+        }
+    }
+
+    private func enqueuePendingNotification(
+        _ notification: CodexAppServerNotification,
+        for threadID: String
+    ) {
+        var pending = pendingNotificationsByThreadID[threadID] ?? []
+
+        switch notification {
+        case .threadStatusChanged:
+            pending.removeAll {
+                if case .threadStatusChanged = $0 { true } else { false }
+            }
+        default:
+            break
+        }
+
+        pending.append(notification)
+        if pending.count > Self.maxPendingNotificationsPerThread {
+            pending.removeFirst(pending.count - Self.maxPendingNotificationsPerThread)
+        }
+        pendingNotificationsByThreadID[threadID] = pending
+    }
+
+    private func replayPendingNotifications(for threadID: String) {
+        guard let notifications = pendingNotificationsByThreadID.removeValue(forKey: threadID) else {
+            return
+        }
+        for notification in notifications {
+            handleNotification(notification)
+        }
+    }
+
     private func enrichTrackedThread(
         _ thread: CodexThread,
         runtimeSurface: CodexRuntimeSurface
@@ -392,7 +468,9 @@ final class CodexAppServerCoordinator {
 
     private func emitTitleUpdated(sessionID: String, title: String?) {
         guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !title.isEmpty else {
+              !title.isEmpty,
+              title != existingThreadTitle(sessionID)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) else {
             return
         }
 
